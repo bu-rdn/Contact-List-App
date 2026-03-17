@@ -1,0 +1,305 @@
+from flask import Flask, render_template, request, send_file
+import requests
+import pandas as pd
+import socket
+import urllib.parse
+import time
+import io
+
+app = Flask(__name__)
+
+DEFAULT_SEARCH_RADIUS_MILES = 50
+DEFAULT_BUSINESS_TYPES = ["property manager", "realtor", "apartment"]
+TYPE_MAP = {
+    "property manager": "PM",
+    "realtor": "R",
+    "apartment": "APT",
+}
+
+
+def get_coordinates(address, api_key):
+    base_url = "https://maps.googleapis.com/maps/api/geocode/json"
+    params = {"address": address, "key": api_key}
+    try:
+        response = requests.get(base_url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        if data["status"] == "OK" and data["results"]:
+            location = data["results"][0]["geometry"]["location"]
+            return location["lat"], location["lng"]
+        return None, None
+    except requests.exceptions.RequestException:
+        return None, None
+
+
+def search_places(query, location, radius, api_key):
+    all_places = []
+    next_page_token = None
+
+    while True:
+        url = (
+            "https://maps.googleapis.com/maps/api/place/textsearch/json"
+            f"?query={query}&location={location}&radius={radius}&key={api_key}"
+        )
+        if next_page_token:
+            url += f"&pagetoken={next_page_token}"
+
+        try:
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+
+            all_places.extend(data.get("results", []))
+            next_page_token = data.get("next_page_token")
+
+            if not next_page_token:
+                break
+
+            time.sleep(2)
+        except requests.exceptions.RequestException:
+            break
+
+    return all_places
+
+
+def place_details(place_id, api_key):
+    url = (
+        "https://maps.googleapis.com/maps/api/place/details/json"
+        f"?place_id={place_id}&key={api_key}"
+    )
+    try:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        return r.json().get("result", {})
+    except requests.exceptions.RequestException:
+        return {}
+
+
+def infer_type_from_query(query_text):
+    q = query_text.lower()
+    for k, v in TYPE_MAP.items():
+        if k in q:
+            return v
+    return ""
+
+
+def run_scraper(api_key, target_cities, business_types, search_radius_meters):
+    if not api_key or not target_cities or not business_types:
+        return pd.DataFrame(), "Missing required parameters."
+
+    all_raw_results = []
+    deduplicated_results_map = {}
+
+    for current_target_city_state in target_cities:
+        current_lat, current_lng = get_coordinates(current_target_city_state, api_key)
+
+        if current_lat is None or current_lng is None:
+            continue
+
+        for business_type in business_types:
+            query = f"{current_target_city_state} {business_type}"
+            short_type = infer_type_from_query(business_type)
+
+            places = search_places(
+                query=query,
+                location=f"{current_lat},{current_lng}",
+                radius=search_radius_meters,
+                api_key=api_key,
+            )
+
+            for p in places:
+                place_id = p.get("place_id")
+                if not place_id:
+                    continue
+
+                details = place_details(place_id, api_key)
+
+                address = details.get("formatted_address", "")
+                city = ""
+                state = ""
+                zip_code = ""
+
+                for component in details.get("address_components", []):
+                    types = component.get("types", [])
+                    if "locality" in types:
+                        city = component.get("long_name")
+                    elif "administrative_area_level_1" in types:
+                        state = component.get("short_name")
+                    elif "postal_code" in types:
+                        zip_code = component.get("long_name")
+
+                row = {
+                    "Type": short_type,
+                    "Source": "Google",
+                    "Organization": details.get("name"),
+                    "Address": address,
+                    "City": city,
+                    "State": state,
+                    "Zip": zip_code,
+                    "Phone": details.get("formatted_phone_number"),
+                    "Notes": "",
+                    "Contact Name": "",
+                    "Title": "",
+                    "Website": details.get("website"),
+                    "Email": "",
+                    "Rating": details.get("rating"),
+                    "Query Source": query,
+                    "Searched City": current_target_city_state,
+                }
+
+                all_raw_results.append(row)
+
+    for row in all_raw_results:
+        unique_key = (row.get("Organization"), row.get("Address"))
+
+        if unique_key in deduplicated_results_map:
+            existing_entry = deduplicated_results_map[unique_key]
+            current_types = set(existing_entry["Type"].split("/")) if existing_entry["Type"] else set()
+            new_type = row.get("Type")
+            if new_type:
+                current_types.add(new_type)
+            existing_entry["Type"] = "/".join(sorted(t for t in current_types if t))
+        else:
+            deduplicated_results_map[unique_key] = row.copy()
+
+    results = list(deduplicated_results_map.values())
+    df = pd.DataFrame(results)
+    return df, None
+
+
+def check_dns_resolution(url):
+    if pd.isna(url) or not url:
+        return False
+    try:
+        if not urllib.parse.urlparse(url).scheme:
+            url = "http://" + url
+        hostname = urllib.parse.urlparse(url).netloc
+        if not hostname:
+            return False
+        socket.gethostbyname(hostname)
+        return True
+    except (socket.gaierror, AttributeError, ValueError):
+        return False
+
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    df_html = None
+    error_message = None
+    download_ready = False
+    results_count = 0
+
+    if request.method == "POST":
+        api_key = request.form["api_key"]
+        target_city_state_list = [
+            c.strip() for c in request.form["target_cities"].split("\n") if c.strip()
+        ]
+        search_radius_miles = float(request.form["search_radius_miles"])
+        business_types = [
+            b.strip() for b in request.form["business_types"].split("\n") if b.strip()
+        ]
+
+        search_radius_meters = search_radius_miles * 1609.34
+
+        initial_df, msg = run_scraper(
+            api_key,
+            target_city_state_list,
+            business_types,
+            search_radius_meters,
+        )
+
+        if msg:
+            error_message = msg
+        elif not initial_df.empty:
+            initial_df["DNS_Resolves"] = initial_df["Website"].apply(check_dns_resolution)
+            filtered_df = initial_df.sort_values(
+                by=["Rating", "Organization"],
+                ascending=[False, True],
+            ).copy()
+
+            results_count = len(filtered_df)
+            df_html = filtered_df.head(10).to_html(
+                classes="results-table",
+                index=False,
+                border=0,
+            )
+
+            output_city_segment = "_and_".join(
+                [city.split(",")[0].strip().replace(" ", "_") for city in target_city_state_list]
+            )
+            new_output_file_name = f"Prioritized_{output_city_segment}_Contacts.xlsx"
+
+            desired_cols = [
+                "Type", "Source", "Organization", "Address", "City", "State", "Zip", "Phone",
+                "Notes", "Contact Name", "Title", "Website", "Email", "Rating",
+                "Query Source", "DNS_Resolves", "Searched City"
+            ]
+            filtered_df = filtered_df.reindex(columns=desired_cols)
+
+            output = io.BytesIO()
+            writer = pd.ExcelWriter(output, engine="xlsxwriter")
+            filtered_df.to_excel(writer, sheet_name="Prioritized Contacts", index=False)
+
+            workbook = writer.book
+            worksheet = writer.sheets["Prioritized Contacts"]
+
+            green_format = workbook.add_format({"bg_color": "#C6EFCE"})
+            red_format = workbook.add_format({"bg_color": "#FFC7CE"})
+
+            dns_resolves_col_idx = filtered_df.columns.get_loc("DNS_Resolves")
+
+            def get_excel_column_name(col_idx_val):
+                name = ""
+                while col_idx_val >= 0:
+                    name = chr(col_idx_val % 26 + ord("A")) + name
+                    col_idx_val = col_idx_val // 26 - 1
+                return name
+
+            excel_col_name = get_excel_column_name(dns_resolves_col_idx)
+            cell_range = f"{excel_col_name}2:{excel_col_name}{len(filtered_df) + 1}"
+
+            worksheet.conditional_format(
+                cell_range,
+                {"type": "cell", "criteria": "==", "value": True, "format": green_format},
+            )
+            worksheet.conditional_format(
+                cell_range,
+                {"type": "cell", "criteria": "==", "value": False, "format": red_format},
+            )
+
+            writer.close()
+            output.seek(0)
+
+            app.config["EXCEL_FILE_DATA"] = output.getvalue()
+            app.config["EXCEL_FILE_NAME"] = new_output_file_name
+            download_ready = True
+        else:
+            error_message = "No data was collected. Please check your API key, cities, and business types."
+
+    return render_template(
+        "index.html",
+        df_html=df_html,
+        error_message=error_message,
+        download_ready=download_ready,
+        results_count=results_count,
+        default_cities="\n".join(["Panama City, FL", "New York, NY"]),
+        default_business_types="\n".join(DEFAULT_BUSINESS_TYPES),
+        default_radius=DEFAULT_SEARCH_RADIUS_MILES,
+    )
+
+
+@app.route("/download")
+def download_file():
+    if "EXCEL_FILE_DATA" in app.config and "EXCEL_FILE_NAME" in app.config:
+        return send_file(
+            io.BytesIO(app.config["EXCEL_FILE_DATA"]),
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            as_attachment=True,
+            download_name=app.config["EXCEL_FILE_NAME"],
+        )
+    return "No file to download", 404
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
